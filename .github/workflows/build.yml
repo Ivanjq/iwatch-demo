@@ -9,13 +9,13 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: pull code
+      - name: 拉代码
         uses: actions/checkout@v3
 
-      - name: select Xcode
+      - name: 选择 Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: iWatch-demo
+      - name: 构建项目
         run: |
           xcodebuild \
           -scheme iwatch-demo \
