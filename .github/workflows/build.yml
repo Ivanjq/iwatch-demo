@@ -1,27 +1,357 @@
-name: Build WatchOS Demo
+name: Build iOS and watchOS
+run-name: "${{ github.workflow }} · ${{ github.ref_name }}"
 
 on:
   push:
     branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "可选：指定 Scheme（留空自动选择第一个）"
+        required: false
+        type: string
+      release_ipa:
+        description: "是否执行签名打包并导出 IPA"
+        required: true
+        default: false
+        type: boolean
+      upload_testflight:
+        description: "是否在导出后上传到 TestFlight"
+        required: true
+        default: false
+        type: boolean
+      deploy_env:
+        description: "发布环境（仅手动触发生效）"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      export_method:
+        description: "导出方式（auto 按环境自动映射）"
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - app-store
+          - ad-hoc
+          - development
 
 jobs:
   build:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      XCODE_PROJECT: iwatch-demo.xcodeproj
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Resolve scheme
+        id: scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_PATH="${XCODE_PROJECT}"
+          if [[ ! -d "${PROJECT_PATH}" ]]; then
+            echo "::error::未找到 ${PROJECT_PATH}。请检查仓库结构或修改 env.XCODE_PROJECT。"
+            exit 1
+          fi
+          INPUT_SCHEME="${{ inputs.scheme }}"
+          if [[ -z "${INPUT_SCHEME}" ]]; then
+            INPUT_SCHEME="${SCHEME:-}"
+          fi
+          if [[ -n "${INPUT_SCHEME}" ]]; then
+            SELECTED_SCHEME="${INPUT_SCHEME}"
+          else
+            SELECTED_SCHEME="$(
+              xcodebuild -list -json -project "${PROJECT_PATH}" \
+              | /usr/bin/python3 -c "import sys, json; data=json.load(sys.stdin); schemes=data.get('project', {}).get('schemes', []); print(schemes[0] if schemes else '')"
+            )"
+          fi
+          if [[ -z "${SELECTED_SCHEME}" ]]; then
+            echo "::error::无法解析 Scheme。请在仓库变量 SCHEME 或手动触发参数里提供。"
+            exit 1
+          fi
+          echo "scheme=${SELECTED_SCHEME}" >> "${GITHUB_OUTPUT}"
+          echo "Selected scheme: ${SELECTED_SCHEME}"
+
+      - name: Build for iOS Simulator (no signing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${XCODE_PROJECT}" \
+            -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build for watchOS Simulator (no signing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${XCODE_PROJECT}" \
+            -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -destination "generic/platform=watchOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_ipa) }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'prod' || (github.event_name == 'workflow_dispatch' && inputs.deploy_env) || 'staging' }}
+    env:
+      XCODE_PROJECT: iwatch-demo.xcodeproj
+      ARCHIVE_PATH: ${{ runner.temp }}/App.xcarchive
+      EXPORT_PATH: ${{ runner.temp }}/export
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: List files
-        run: ls -la
-
-      - name: List schemes
-        run: xcodebuild -list
-
-      - name: Build
+      - name: Select latest stable Xcode
         run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Validate tag format for auto release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::非法发布 Tag: ${TAG}。仅允许 vX.Y.Z（例如 v1.2.3）。"
+            exit 1
+          fi
+          echo "Tag format valid: ${TAG}"
+
+      - name: Resolve scheme
+        id: scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_PATH="${XCODE_PROJECT}"
+          if [[ ! -d "${PROJECT_PATH}" ]]; then
+            echo "::error::未找到 ${PROJECT_PATH}。请检查仓库结构或修改 env.XCODE_PROJECT。"
+            exit 1
+          fi
+          INPUT_SCHEME="${{ inputs.scheme }}"
+          if [[ -z "${INPUT_SCHEME}" ]]; then
+            INPUT_SCHEME="${SCHEME:-}"
+          fi
+          if [[ -n "${INPUT_SCHEME}" ]]; then
+            SELECTED_SCHEME="${INPUT_SCHEME}"
+          else
+            SELECTED_SCHEME="$(
+              xcodebuild -list -json -project "${PROJECT_PATH}" \
+              | /usr/bin/python3 -c "import sys, json; data=json.load(sys.stdin); schemes=data.get('project', {}).get('schemes', []); print(schemes[0] if schemes else '')"
+            )"
+          fi
+          if [[ -z "${SELECTED_SCHEME}" ]]; then
+            echo "::error::无法解析 Scheme。请在仓库变量 SCHEME 或手动触发参数里提供。"
+            exit 1
+          fi
+          echo "scheme=${SELECTED_SCHEME}" >> "${GITHUB_OUTPUT}"
+          echo "Selected scheme: ${SELECTED_SCHEME}"
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          MARKETING_VERSION="1.0.0"
+          DEPLOY_ENV="staging"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            DEPLOY_ENV="prod"
+            MARKETING_VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            DEPLOY_ENV="${{ inputs.deploy_env }}"
+          fi
+
+          EXPORT_METHOD_INPUT="${{ inputs.export_method }}"
+          if [[ -z "${EXPORT_METHOD_INPUT}" || "${EXPORT_METHOD_INPUT}" == "auto" ]]; then
+            case "${DEPLOY_ENV}" in
+              dev) EXPORT_METHOD="development" ;;
+              staging) EXPORT_METHOD="ad-hoc" ;;
+              prod) EXPORT_METHOD="app-store" ;;
+              *) EXPORT_METHOD="ad-hoc" ;;
+            esac
+          else
+            EXPORT_METHOD="${EXPORT_METHOD_INPUT}"
+          fi
+
+          SHOULD_UPLOAD_TESTFLIGHT="false"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            SHOULD_UPLOAD_TESTFLIGHT="true"
+          elif [[ "${{ inputs.upload_testflight }}" == "true" ]]; then
+            SHOULD_UPLOAD_TESTFLIGHT="true"
+          fi
+
+          echo "build_number=${BUILD_NUMBER}" >> "${GITHUB_OUTPUT}"
+          echo "marketing_version=${MARKETING_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "deploy_env=${DEPLOY_ENV}" >> "${GITHUB_OUTPUT}"
+          echo "export_method=${EXPORT_METHOD}" >> "${GITHUB_OUTPUT}"
+          echo "should_upload_testflight=${SHOULD_UPLOAD_TESTFLIGHT}" >> "${GITHUB_OUTPUT}"
+
+          echo "Build number: ${BUILD_NUMBER}"
+          echo "Marketing version: ${MARKETING_VERSION}"
+          echo "Deploy env: ${DEPLOY_ENV}"
+          echo "Export method: ${EXPORT_METHOD}"
+          echo "Upload TestFlight: ${SHOULD_UPLOAD_TESTFLIGHT}"
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          required=(
+            IOS_CERTIFICATE_BASE64
+            IOS_CERTIFICATE_PASSWORD
+            IOS_PROVISION_PROFILE_BASE64
+            KEYCHAIN_PASSWORD
+            APPLE_TEAM_ID
+          )
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "::error::缺少必需 Secret: ${key}"
+              exit 1
+            fi
+          done
+
+      - name: Setup signing certificate and provisioning profile
+        shell: bash
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="${RUNNER_TEMP}/certificate.p12"
+          PROFILE_PATH="${RUNNER_TEMP}/profile.mobileprovision"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/build.keychain-db"
+          export CERT_PATH PROFILE_PATH
+
+          /usr/bin/python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["CERT_PATH"]).write_bytes(base64.b64decode(os.environ["IOS_CERTIFICATE_BASE64"]))
+          pathlib.Path(os.environ["PROFILE_PATH"]).write_bytes(base64.b64decode(os.environ["IOS_PROVISION_PROFILE_BASE64"]))
+          PY
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+          security default-keychain -s "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" -k "${KEYCHAIN_PATH}" -P "${IOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          mkdir -p "${HOME}/Library/MobileDevice/Provisioning Profiles"
+          cp "${PROFILE_PATH}" "${HOME}/Library/MobileDevice/Provisioning Profiles/ci.mobileprovision"
+
+      - name: Archive app
+        shell: bash
+        run: |
+          set -euo pipefail
           xcodebuild \
-          -scheme iwatch-demo \
-          -destination 'platform=iOS Simulator,name=iPhone 15' \
-          CODE_SIGNING_ALLOWED=NO \
-          build
+            -project "${XCODE_PROJECT}" \
+            -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "${ARCHIVE_PATH}" \
+            CURRENT_PROJECT_VERSION="${{ steps.release_meta.outputs.build_number }}" \
+            MARKETING_VERSION="${{ steps.release_meta.outputs.marketing_version }}" \
+            clean archive
+
+      - name: Create export options plist
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${{ steps.release_meta.outputs.export_method }}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "${ARCHIVE_PATH}" \
+            -exportPath "${EXPORT_PATH}" \
+            -exportOptionsPlist "${RUNNER_TEMP}/ExportOptions.plist"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ steps.release_meta.outputs.deploy_env }}-${{ steps.release_meta.outputs.build_number }}
+          path: ${{ env.EXPORT_PATH }}/*.ipa
+          if-no-files-found: error
+
+      - name: Upload to TestFlight
+        if: ${{ steps.release_meta.outputs.should_upload_testflight == 'true' }}
+        shell: bash
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPSTORE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          required=(APPSTORE_API_KEY_ID APPSTORE_API_ISSUER_ID APPSTORE_API_PRIVATE_KEY_BASE64)
+          for key in "${required[@]}"; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "::error::需要上传 TestFlight，但缺少 Secret: ${key}"
+              exit 1
+            fi
+          done
+          mkdir -p "${HOME}/private_keys"
+          KEY_PATH="${HOME}/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+          export KEY_PATH
+          /usr/bin/python3 - <<'PY'
+          import base64, os, pathlib
+          pathlib.Path(os.environ["KEY_PATH"]).write_bytes(base64.b64decode(os.environ["APPSTORE_API_PRIVATE_KEY_BASE64"]))
+          PY
+          IPA_PATH="$(ls "${EXPORT_PATH}"/*.ipa | head -n 1)"
+          xcrun altool --upload-app \
+            --type ios \
+            --file "${IPA_PATH}" \
+            --apiKey "${APPSTORE_API_KEY_ID}" \
+            --apiIssuer "${APPSTORE_API_ISSUER_ID}"
